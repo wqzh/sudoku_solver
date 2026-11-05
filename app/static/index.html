@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>数独识别求解 · Sudoku Solver</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">9</span>
+      <div>
+        <h1>数独识别求解</h1>
+        <p>YOLO 网格检测 + 数字识别 + 自动求解</p>
+      </div>
+    </div>
+    <div class="status" id="modelStatus">模型加载中…</div>
+  </header>
+
+  <main class="layout">
+    <!-- ================= 左：上传 ================= -->
+    <section class="panel panel-left">
+      <div class="panel-head">
+        <h2>1 · 上传题目</h2>
+        <span class="hint">JPG / PNG / BMP / WEBP</span>
+      </div>
+
+      <div id="dropZone" class="dropzone" tabindex="0">
+        <input type="file" id="fileInput" accept="image/*" hidden />
+        <div class="dz-inner" id="dzEmpty">
+          <svg viewBox="0 0 24 24" class="dz-icon" aria-hidden="true">
+            <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"
+              fill="none" stroke="currentColor" stroke-width="1.6"
+              stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <p class="dz-title">点击或拖拽图片到此处</p>
+          <p class="dz-sub">也可以直接 Ctrl+V 粘贴剪贴板里的图片</p>
+        </div>
+        <div class="dz-preview" id="dzPreview" hidden>
+          <img id="previewImg" alt="待识别图片预览" />
+        </div>
+      </div>
+
+      <div class="filemeta" id="fileMeta" hidden></div>
+
+      <div class="controls">
+        <button id="solveBtn" class="btn primary" disabled>Solve 求解</button>
+        <button id="clearBtn" class="btn ghost" disabled>清空</button>
+      </div>
+
+      <div class="tips">
+        <p>· 支持打印/拍照/手写的数独题目</p>
+        <p>· 输出图片尺寸与原图完全一致</p>
+        <p>· 新填数字为红色，原有数字保持原色</p>
+      </div>
+    </section>
+
+    <!-- ================= 右：结果 ================= -->
+    <section class="panel panel-right">
+      <div class="panel-head">
+        <h2>2 · 识别与答案</h2>
+        <div class="head-actions">
+          <label class="switch" title="显示 YOLO 检测框">
+            <input type="checkbox" id="boxToggle" checked />
+            <span>检测框</span>
+          </label>
+          <button id="downloadBtn" class="btn small" disabled>下载图片</button>
+        </div>
+      </div>
+
+      <div class="viewer" id="viewer">
+        <div class="placeholder" id="placeholder">
+          <div class="ph-grid" aria-hidden="true">
+            <span></span><span></span><span></span>
+            <span></span><span></span><span></span>
+            <span></span><span></span><span></span>
+          </div>
+          <p>求解后的图片会显示在这里</p>
+        </div>
+
+        <div class="stage" id="stage" hidden>
+          <img id="resultImg" alt="求解结果" />
+          <div class="boxes" id="boxLayer"></div>
+        </div>
+
+        <div class="loading" id="loading" hidden>
+          <div class="spinner"></div>
+          <p>正在检测网格并求解…</p>
+        </div>
+      </div>
+
+      <div class="resultbar">
+        <div class="badge" id="resultBadge">等待上传</div>
+        <div class="stats" id="stats"></div>
+      </div>
+
+      <div class="alert" id="alert" hidden></div>
+
+      <details class="boardbox" id="boardBox" hidden>
+        <summary>识别到的盘面 / 解答</summary>
+        <div class="board" id="board"></div>
+        <div class="legend">
+          <span><i class="dot given"></i>原有数字</span>
+          <span><i class="dot fill"></i>求解填入</span>
+        </div>
+      </details>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
