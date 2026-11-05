@@ -1,7 +1,9 @@
-import cv2
-import os
-import numpy as np
 import argparse
+import os
+import time
+
+import cv2
+import numpy as np
 
 import utils as sutils
 
@@ -9,117 +11,125 @@ import utils as sutils
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
 
-def solve_sudoku_puzzle(loaded_model, img_fpath):
-    """Solve a single sudoku image and return the annotated result image (RGB).
-
-    Returns None if the grid cannot be detected or the puzzle cannot be solved.
-    """
-    # Check for valid filepath because cv2.imread fails silently
-    if not os.path.exists(img_fpath):
-        print(f"  [SKIP] File not found: '{img_fpath}'")
+def read_image_rgb(fpath):
+    """Read an image as RGB. Uses imdecode so non-ASCII Windows paths work."""
+    try:
+        data = np.fromfile(fpath, dtype=np.uint8)
+    except OSError:
         return None
-
-    # Load image, change color space from BGR to RGB, and resize
-    img = cv2.imread(img_fpath)
+    if data.size == 0:
+        return None
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
-        print(f"  [SKIP] cv2.imread failed to read: '{img_fpath}'")
         return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = sutils.resize_and_maintain_aspect_ratio(input_image=img, new_width=1000)
-
-    # Load the digit-classification model (ONNX format)
-    # loaded_model = sutils.OnnxModel(model_fpath)
-
-    # Locate grid cells in image
-    detection = sutils.get_valid_cells_from_image(img)
-    if detection is None:
-        print("  [FAIL] Could not locate a valid sudoku grid in the image.")
-        return None
-    cells, M, board_image = detection
-
-    # Get the 2D array of the puzzle grid to be passed to the solver
-    grid_array = sutils.get_predicted_sudoku_grid(loaded_model, cells)
-
-    # Create an instance of SudokuSolver and try to solve the puzzle
-    solver = sutils.SudokuSolver(board=grid_array)
-    solver.solve()
-
-    # If there are no zeros left, the puzzle is solved
-    if np.any(solver.board == 0):
-        print("  [FAIL] Could not solve the puzzle. Check for misclassified digits.")
-        return None
-
-    # Get the image of the board annotated with the solution
-    print("  [OK] Sudoku solved.")
-    return sutils.generate_solution_image(img, board_image, cells, solver.board, M)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def save_result_image(annotated_img, out_fpath):
-    """Save the annotated (RGB) image to disk as a file, no popup display."""
-    bgr_img = cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR)
-    return cv2.imwrite(out_fpath, bgr_img)
+def write_image_rgb(fpath, rgb_img):
+    """Write an RGB image to disk (works with non-ASCII Windows paths)."""
+    bgr = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+    ext = os.path.splitext(fpath)[1] or ".png"
+    ok, buf = cv2.imencode(ext, bgr)
+    if not ok:
+        return False
+    try:
+        buf.tofile(fpath)
+    except OSError:
+        return False
+    return True
+
+
+def solve_sudoku_puzzle(loaded_model, img_fpath, time_budget=20.0):
+    """Solve a single sudoku image. Returns a sutils.SolveResult."""
+    if not os.path.exists(img_fpath):
+        return sutils.SolveResult(message=f"file not found: '{img_fpath}'")
+
+    img = read_image_rgb(img_fpath)
+    if img is None:
+        return sutils.SolveResult(message=f"cannot decode image: '{img_fpath}'")
+
+    img = sutils.resize_and_maintain_aspect_ratio(img, new_width=1000)
+    return sutils.solve_sudoku_image(loaded_model, img, time_budget=time_budget)
 
 
 def main():
-    # Construct an argument parser and parse the arguments
-    ap = argparse.ArgumentParser(description="Batch sudoku solver: detect, solve and save results for every image in an input directory.")
-    ap.add_argument("--input_dir", type=str, required=True, help="Directory containing sudoku images to process")
-    ap.add_argument("--output_dir", type=str, required=True, help="Directory where annotated result images will be saved")
-    ap.add_argument("--model_fpath", default="src_onnx/model.onnx", type=str, help="Path to digit-classification model in ONNX format")
-    args = vars(ap.parse_args())
+    ap = argparse.ArgumentParser(
+        description="Batch sudoku solver: detect, solve and save results for every image in a directory.")
+    ap.add_argument("--input_dir", type=str, required=True,
+                    help="Directory containing sudoku images to process")
+    ap.add_argument("--output_dir", type=str, required=True,
+                    help="Directory where annotated result images will be saved")
+    ap.add_argument("--model_fpath", default="src_onnx/model.onnx", type=str,
+                    help="Path to digit-classification model in ONNX format")
+    ap.add_argument("--debug_dir", default=None, type=str,
+                    help="Optional: save a debug picture (warped grid + detected lines + "
+                         "recognised digits) for every image that fails")
+    ap.add_argument("--time_budget", default=20.0, type=float,
+                    help="Max seconds spent on a single image (guards against hangs)")
+    args = ap.parse_args()
 
-    input_dir = args["input_dir"]
-    output_dir = args["output_dir"]
-    model_fpath = args["model_fpath"]
+    if not os.path.isdir(args.input_dir):
+        raise FileNotFoundError(f"Input directory not found: '{args.input_dir}'")
+    if not os.path.exists(args.model_fpath):
+        raise FileNotFoundError(f"Model file not found: '{args.model_fpath}'")
 
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Input directory not found: '{input_dir}'")
-    if not os.path.exists(model_fpath):
-        raise FileNotFoundError(f"Model file not found: '{model_fpath}'")
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.debug_dir:
+        os.makedirs(args.debug_dir, exist_ok=True)
 
-    # Create the output directory if it does not exist yet
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Collect all image files (non-recursive) from the input directory
     img_fpaths = sorted(
-        os.path.join(input_dir, f)
-        for f in os.listdir(input_dir)
+        os.path.join(args.input_dir, f)
+        for f in os.listdir(args.input_dir)
         if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
     )
     if not img_fpaths:
-        print(f"No images found in '{input_dir}'.")
+        print(f"No images found in '{args.input_dir}'.")
         return
 
-    print(f"Found {len(img_fpaths)} image(s) in '{input_dir}'.")
-    print(f"Results will be saved to '{output_dir}'.\n")
+    print(f"Found {len(img_fpaths)} image(s) in '{args.input_dir}'.")
+    print(f"Results will be saved to '{args.output_dir}'.\n")
+
+    loaded_model = sutils.OnnxModel(args.model_fpath)
 
     n_solved = 0
-    n_failed = 0
-    loaded_model = sutils.OnnxModel(model_fpath)
-    
-    for i, img_fpath in enumerate(img_fpaths, start=1):
-        filename = os.path.basename(img_fpath)
-        out_fpath = os.path.join(output_dir, filename)
-        print(f"[{i}/{len(img_fpaths)}] Processing '{filename}'...")
+    failed = []  # (filename, reason)
 
-        try:
-            annotated_img = solve_sudoku_puzzle(loaded_model, img_fpath)
-        except Exception as exc:
-            print(f"  [ERROR] Unexpected error: {exc}")
-            annotated_img = None
+    try:
+        for i, img_fpath in enumerate(img_fpaths, start=1):
+            if i==5: break
+            filename = os.path.basename(img_fpath)
+            out_fpath = os.path.join(args.output_dir, filename)
+            print(f"[{i}/{len(img_fpaths)}] Processing '{filename}'...", flush=True)
 
-        if annotated_img is not None:
-            if save_result_image(annotated_img, out_fpath):
-                print(f"  [SAVED] '{out_fpath}'")
-                n_solved += 1
+            t0 = time.time()
+            try:
+                result = solve_sudoku_puzzle(loaded_model, img_fpath, args.time_budget)
+            except Exception as exc:  # keep the batch going no matter what
+                result = sutils.SolveResult(message=f"unexpected error: {exc!r}")
+            dt = time.time() - t0
+
+            if result.ok:
+                if write_image_rgb(out_fpath, result.annotated):
+                    print(f"  [OK] {result.message} -> '{out_fpath}' ({dt:.1f}s)")
+                    n_solved += 1
+                else:
+                    print(f"  [ERROR] failed to write '{out_fpath}'")
+                    failed.append((filename, "write failed"))
             else:
-                print(f"  [ERROR] cv2.imwrite failed to write '{out_fpath}'.")
-                n_failed += 1
-        else:
-            n_failed += 1
+                print(f"  [FAIL] {result.message} ({dt:.1f}s)")
+                failed.append((filename, result.message))
+                if args.debug_dir and result.debug_image is not None:
+                    stem = os.path.splitext(filename)[0]
+                    write_image_rgb(os.path.join(args.debug_dir, stem + "_debug.png"),
+                                    result.debug_image)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
 
-    print(f"\nDone. Solved and saved: {n_solved}, failed/skipped: {n_failed}.")
-
+    print(f"\nDone. Solved and saved: {n_solved}, failed/skipped: {len(failed)}.")
+    if failed:
+        print("Failed files:")
+        for name, reason in failed:
+            print(f"  - {name}: {reason}")
 
 if __name__ == "__main__":
     main()

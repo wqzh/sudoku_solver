@@ -1,790 +1,740 @@
-# Functions for solving sudoku puzzles
+# Robust utilities for locating, reading and solving sudoku puzzles in images.
+#
+# Pipeline overview
+#   1. Pad the image with a white frame (so grids touching the image border
+#      still have a closed outline).
+#   2. Generate many grid-outline candidates (several threshold strategies,
+#      hull / minAreaRect fallbacks, whole-image fallback).
+#   3. Warp every candidate to a square, measure how much it "looks like" a
+#      9x9 grid (line-profile score), tighten the quad, and rank candidates.
+#   4. Slice the warped grid into 81 cells using the detected grid lines
+#      (no dependency on per-cell contours any more).
+#   5. Classify digits with the ONNX model, then solve with a fast bit-mask
+#      solver that has a time/node limit. If the board is inconsistent, retry
+#      with the least-confident digits swapped for their 2nd-best class, and
+#      with the grid rotated by 90/180/270 degrees.
+
+import math
+import os
+import time
+from dataclasses import dataclass
+from itertools import combinations
+from typing import Optional
 
 import cv2
-import imutils
-import os
-import matplotlib.pyplot as plt
 import numpy as np
 import onnxruntime as ort
 
 
-import math
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+CELL_SIZE = 80                       # px per cell in the warped grid
+GRID_SIZE = 9 * CELL_SIZE            # 720
+WARP_PAD = 10                        # margin around the grid in the warped image
+SIDE = GRID_SIZE + 2 * WARP_PAD      # side of the warped (square) image
+IMG_PAD = 24                         # white frame added around the input image
+
+MIN_GRID_FRACTION = 0.04             # min area of a candidate quad (fraction of image)
+MIN_GRID_SCORE = 0.20                # min "looks like a sudoku" score
+MIN_GIVENS = 17                      # a valid sudoku has at least 17 clues
+CELL_BORDER_FRACTION = 0.08          # border blanked inside every cell
+
+_POPCOUNT = [bin(i).count("1") for i in range(1024)]
 
 
-class SudokuSolver():
-    def __init__(self, board):
+# --------------------------------------------------------------------------- #
+# Solver
+# --------------------------------------------------------------------------- #
+class SudokuSolver:
+    """Bit-mask backtracking solver with MRV heuristic and a time/node limit.
+
+    solve() returns True and replaces self.board with the solution on success;
+    on failure (invalid board, no solution, or limit hit) self.board is left
+    untouched and False is returned.
+    """
+
+    def __init__(self, board, max_nodes=400_000, timeout=3.0):
         self.board = board
-    
-    
+        self.max_nodes = max_nodes
+        self.timeout = timeout
+        self.nodes = 0
+        self.timed_out = False
+
     def set_new_board(self, new_board):
         self.board = new_board
-    
-    
+
     def print_board(self):
-        num_rows = len(self.board)
-        num_cols = len(self.board[0])
-        square_size = int(math.sqrt(num_rows))
-        
-        # Print one row at a time
-        for row in range(num_rows):
-            # Insert characters to define grid lines
-            if row != 0 and row % square_size == 0:
-                print("- " * (num_cols + square_size - 1))
-            
-            # Print numbers at each column
-            for col in range(num_cols):
-                # Insert characters to define grid lines
-                if col != 0 and col % square_size == 0:
-                    print("| ", end="")
-                
-                # Print numbers - only include newline at last column
-                number = self.board[row][col]
-                if col < num_cols-1:
-                    print(f"{number} ", end="")
-                else:
-                    print(number)
-                
+        for r in range(9):
+            if r and r % 3 == 0:
+                print("- " * 11)
+            row = ""
+            for c in range(9):
+                if c and c % 3 == 0:
+                    row += "| "
+                row += f"{self.board[r][c]} "
+            print(row)
 
-    def find_next_empty(self, empty_val: int=0):
-        # Iterate through the board one row at a time, from left to right,
-        # checking for zeros. Return the index of the first zero found, otherwise
-        # return None
-        num_rows = len(self.board)
-        num_cols = len(self.board[0])
-        
-        for row in range(num_rows):
-            for col in range(num_cols):
-                if self.board[row][col] == empty_val:
-                    return (row, col)
-                
-        return None
-
-
-    def is_valid_number(self, board, number, position):
-        '''
-        Check whether or not it is valid to insert a particular number at a
-        specified position on the board.
-        
-        Args:
-            board (list[list[int]]) - list of lists representing current puzzle state
-            number (int) - the number we are testing for validity
-            position (tuple) - the position on the board where number is being inserted
-        Returns:
-            valid (bool) - whether or not the number is valid in the stated position
-        '''
-        
-        # Assign the board dimensions to variables. Assume a square board.
-        num_rows = len(board)
-        square_size = int(math.sqrt(num_rows))
-        
-        # Unpack row and column from position tuple for readability
-        row_idx, col_idx = position
-        
-        # Check if number is already present in current row
-        if number in board[row_idx]:
+    @staticmethod
+    def is_board_valid(board):
+        """True if the board has no duplicate digit in any row/column/box."""
+        b = np.asarray(board)
+        if b.shape != (9, 9) or b.min() < 0 or b.max() > 9:
             return False
-        
-        # Check if number is already present in current column
-        current_column_values = [board[row][col_idx] for row in range(num_rows)]
-        if number in current_column_values:
-            return False
-        
-        # Get indices of the square that our position lies in
-        square_x_idx = col_idx // square_size
-        square_y_idx = row_idx // square_size
-        # Check if number is already present in current square
-        for row in range(square_y_idx * square_size, (square_y_idx * square_size) + square_size):
-            for col in range(square_x_idx * square_size, (square_x_idx * square_size) + square_size):
-                if board[row][col] == number and (row, col) != position:
+        for i in range(9):
+            br, bc = 3 * (i // 3), 3 * (i % 3)
+            units = (b[i, :], b[:, i], b[br:br + 3, bc:bc + 3].ravel())
+            for u in units:
+                u = u[u != 0]
+                if len(np.unique(u)) != len(u):
                     return False
-        
-        # If we reach this point, the number is valid
         return True
-        
-        
-    def solve(self):
-        # Base case - no more empty squares, so we are finished
-        next_empty_pos = self.find_next_empty()
-        
-        if not next_empty_pos:
-            # The board is full - the puzzle is solved
-            return True
-        else:
-            row, col = next_empty_pos
-            
-        # Try every number at the current empty position
-        for i in range(1, 10):
-            # Check if number is valid in this position
-            if self.is_valid_number(board=self.board, number=i, position=(row, col)):
-                # Put the number in the board
-                self.board[row][col] = i
-                # Now continue solving with the updated board (calling solve again)
-                if self.solve():
-                    # No more empty positions - solution found
-                    return True
-    
-        # We are at a dead end and need to backtrack.
-        # Set the current cell value to 0 return False
-        # to continue execution of the previous call to solve.
-        self.board[row][col] = 0
-        return False
-    
 
+    def solve(self):
+        board = np.array(self.board, dtype=int)
+        if not self.is_board_valid(board):
+            return False
+
+        grid = board.tolist()
+        rows, cols, boxes = [0] * 9, [0] * 9, [0] * 9
+        empties = []
+        for r in range(9):
+            for c in range(9):
+                v = grid[r][c]
+                if v:
+                    bit = 1 << v
+                    rows[r] |= bit
+                    cols[c] |= bit
+                    boxes[3 * (r // 3) + c // 3] |= bit
+                else:
+                    empties.append((r, c))
+
+        self.nodes = 0
+        self.timed_out = False
+        deadline = time.monotonic() + self.timeout
+        FULL = 0x3FE  # bits 1..9
+        pc = _POPCOUNT
+
+        def search():
+            self.nodes += 1
+            if self.nodes > self.max_nodes or (
+                (self.nodes & 255) == 0 and time.monotonic() > deadline
+            ):
+                self.timed_out = True
+                return False
+
+            # Pick the empty cell with the fewest candidates (MRV)
+            best, best_mask, best_cnt = None, 0, 10
+            for (r, c) in empties:
+                if grid[r][c]:
+                    continue
+                mask = FULL & ~(rows[r] | cols[c] | boxes[3 * (r // 3) + c // 3])
+                cnt = pc[mask]
+                if cnt == 0:
+                    return False  # dead end
+                if cnt < best_cnt:
+                    best, best_mask, best_cnt = (r, c), mask, cnt
+                    if cnt == 1:
+                        break
+            if best is None:
+                return True  # no empty cell left
+
+            r, c = best
+            b = 3 * (r // 3) + c // 3
+            m = best_mask
+            while m:
+                bit = m & -m
+                m ^= bit
+                grid[r][c] = bit.bit_length() - 1
+                rows[r] |= bit
+                cols[c] |= bit
+                boxes[b] |= bit
+                if search():
+                    return True
+                rows[r] ^= bit
+                cols[c] ^= bit
+                boxes[b] ^= bit
+                grid[r][c] = 0
+                if self.timed_out:
+                    return False
+            return False
+
+        if search():
+            self.board = np.array(grid, dtype=int)
+            return True
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# ONNX model wrapper
+# --------------------------------------------------------------------------- #
 class OnnxModel:
-    '''
-    Minimal wrapper around an onnxruntime InferenceSession that mimics the
-    Keras model.predict interface expected by get_predicted_sudoku_grid.
-    Supports 9-class digit models (labels 1-9), matching the previously
-    used Keras CNN (model_15_epochs_font_mnist).
-    '''
+    """Minimal onnxruntime wrapper that mimics Keras model.predict.
+
+    Input : (N, 28, 28, 1) float array (same format as before, 0..255 values)
+    Output: (N, 9) class scores for digits 1..9
+    """
+
     def __init__(self, model_fpath, providers=None):
         if not os.path.exists(model_fpath):
             raise FileNotFoundError(f"Model file not found: '{model_fpath}'")
         if providers is None:
-            # Prefer GPU execution if available, fall back to CPU
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            wanted = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            available = ort.get_available_providers()
+            providers = [p for p in wanted if p in available] or ["CPUExecutionProvider"]
         self.session = ort.InferenceSession(model_fpath, providers=providers)
         self.input_name = self.session.get_inputs()[0].name
 
     def predict(self, x):
-        '''Run inference on a batch of images (N, 28, 28, 1) and return the
-        (N, 9) array of class probabilities, like Keras model.predict.'''
         x = np.asarray(x, dtype=np.float32)
-        outputs = self.session.run(None, {self.input_name: x})
-        return outputs[0]
+        return self.session.run(None, {self.input_name: x})[0]
 
 
+# --------------------------------------------------------------------------- #
+# Basic image helpers
+# --------------------------------------------------------------------------- #
 def resize_and_maintain_aspect_ratio(input_image, new_width):
-    '''
-    A simple utility function to resize an image by specifying a new width,
-    while maintaining the original aspect ratio.
-    
-    Args:
-        input_image: Array containing image data.
-        new_width: Desired width of the resulting reshaped image.
-    
-    Returns:
-        reshaped_image: Array containing reshaped image data.
-
-    '''
-    
-    # Resize maintaining aspect ratio
-    orig_width, orig_height = input_image.shape[1], input_image.shape[0]
-    # Determine the aspect ratio
-    ratio = new_width / float(orig_width)
-    # Calculate the new height to match new_width, given aspect ratio
-    new_height = int(orig_height * ratio)
-    dim = (new_width, new_height)
-    reshaped_image = cv2.resize(input_image, dim, interpolation=cv2.INTER_AREA)
-    
-    return reshaped_image
+    """Resize to `new_width` keeping the aspect ratio."""
+    h, w = input_image.shape[:2]
+    ratio = new_width / float(w)
+    new_height = max(1, int(round(h * ratio)))
+    interp = cv2.INTER_AREA if ratio < 1 else cv2.INTER_CUBIC
+    return cv2.resize(input_image, (new_width, new_height), interpolation=interp)
 
 
-def apply_grayscale_blur_and_threshold(img, method="mean", blocksize=91, c=7):
-    '''
-    Utility function to convert RGB image to thresholded image.
-    
-    Args:
-        img: Array containing image data.
-        
-        method: Method to use for adaptive thresholding. Options are "mean" or
-                "gaussian", corresponding to cv2.ADAPTIVE_THRESH_MEAN_C and
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, respectively.
-        
-        blocksize: Parameter blockSize passed to cv2.adaptiveThreshold.
-                    Block size defines the neighbourhood of pixels considered
-                    by adaptive threshold.
-        
-        c: Parameter C passed to cv2.adaptiveThreshold. Constant value
-           subtracted from the weighted sum of neighbourhood pixels.
-    
-    Returns:
-        thresh: Thresholded binary image.
-    
-    '''
-    
-    # Apply blur and convert to grayscale
-    img = cv2.GaussianBlur(img, ksize=(3, 3), sigmaX=0)
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+def order_corners(pts):
+    """Order 4 points clockwise, starting from the one closest to top-left.
 
-    if method == "mean":
-        adaptiveMethod = cv2.ADAPTIVE_THRESH_MEAN_C
-    elif method == "gaussian":
-        adaptiveMethod = cv2.ADAPTIVE_THRESH_GAUSSIAN_C
-
-    # Adaptive thresholding
-    thresh = cv2.adaptiveThreshold(gray,
-                                    maxValue=255,
-                                    adaptiveMethod=adaptiveMethod,
-                                    thresholdType=cv2.THRESH_BINARY,
-                                    blockSize=blocksize,
-                                    C=c)
-
-    # Invert the resulting threshold image (black <-> white)
-    thresh = cv2.bitwise_not(thresh)
-
-    return thresh
+    Uses the angle around the centroid, so it also works for rotated quads.
+    Result order: TL, TR, BR, BL for an upright quad.
+    """
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    c = pts.mean(axis=0)
+    ang = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+    pts = pts[np.argsort(ang)]            # clockwise in image coordinates
+    start = int(np.argmin(pts.sum(axis=1)))
+    return np.roll(pts, -start, axis=0).astype(np.float32)
 
 
-def get_quadrilateral_points_in_order(approx_arr):
-    '''
-    Given an array of [x, y] pairs representing corner locations of a
-    quadrilateral, identify which points are top-left (tl), top-right (tr),
-    bottom-right (br), and bottom-left (bl) and return them in this exact
-    order.
-    
-    For each point in approx_arr, calculate the Euclidean distance to the
-    origin (0, 0). Then, define a second origin that resides past the rightmost
-    point in approx_arr. Calculate Euclidean distances between all points and 
-    this new origin.
-    
-    TL and BR are determined by finding the shortest and longest distances
-    wrt origin (0, 0). TR and BL are determined by finding the shortest and
-    longest distances wrt the new origin, excluding those points already
-    assigned to TL and BR (this is important).    
-
-    Args:
-        approx_arr: Array of values representing the corner locations of a quadrilateral. 
-    
-    Returns:
-        Array of [x, y] pairs in the order tl, tr, br, bl.
-    
-    '''
-    
-    try:
-        assert(approx_arr.shape == (4, 1, 2) or approx_arr.shape == (4, 2))
-    except:
-        raise ValueError(f"Incorrect shape for approx_arr: {approx_arr.shape}. Requires shape of (4, 1, 2) or (4, 2).")
-    
-    # Squeeze away the redundant dimension to give us a 2D array if necessary
-    if approx_arr.shape == (4, 1, 2):
-        approx_arr = np.squeeze(approx_arr, axis=1)
-    
-    # Define a point to place the second origin
-    max_x = int(1.1 * np.max(approx_arr[:,0]))
-    
-    # Define the origin locations
-    origin_1 = [0, 0]
-    origin_2 = [max_x, 0]
-
-    # Find the Euclidean distances of all 4 points in the array, to the origin (0, 0)
-    distances_1 = [np.linalg.norm(point - origin_1) for point in approx_arr]
-    # Find the Euclidean distances of all 4 points in the array, to the new origin (max_x, 0)
-    distances_2 = [np.linalg.norm(point - origin_2) for point in approx_arr]
-
-    # Find the indices of the top-left and bottom-right corners
-    tl_idx = np.argmin(distances_1)
-    br_idx = np.argmax(distances_1)
-    
-    # To avoid identifying an index more than once, we set these to np.inf
-    # or -np.inf when selecting the indices for the distances from origin_2
-    
-    # Identify the top right corner
-    dist_arr = distances_2.copy()
-    # Mask out the indices that have already been selected
-    dist_arr[tl_idx] = np.inf
-    dist_arr[br_idx] = np.inf
-    tr_idx = np.argmin(dist_arr)
-    
-    # Identify the bottom left corner
-    dist_arr = distances_2.copy()
-    # Mask out the indices that have already been selected
-    dist_arr[tl_idx] = -np.inf
-    dist_arr[br_idx] = -np.inf
-    bl_idx = np.argmax(dist_arr)
-    
-    # Get the (x, y) points for each corner
-    tl = approx_arr[tl_idx]
-    br = approx_arr[br_idx]
-    tr = approx_arr[tr_idx]
-    bl = approx_arr[bl_idx]
-    
-    return np.array([tl, tr, br, bl])
+def _find_contours(binary, mode):
+    res = cv2.findContours(binary, mode, cv2.CHAIN_APPROX_SIMPLE)
+    return list(res[0] if len(res) == 2 else res[1])
 
 
-def perform_four_point_transform(input_img, src_corners, pad=10):
-    '''
-    Perform a four-point perspective transform to an image such that the four
-    corners in img are mapped to new specified points in the resulting image. 
-
-    Args:
-        input_img: An image array.
-        src_corners: An array of shape (4, 2) containing the (x, y) locations
-                     of the four reference points in input_img.
-        pad: Pixel value for padding applied to all sides of warped image.
-             The warped image then contains pixels extending past the corners,
-             which is useful for accommodating curves in the paper surface for
-             locating the puzzle grid later.
-    
-    Returns:
-        M: transformation matrix.
-        warped: Image resulting from the perspective transform applied to
-                input_img.
-    
-    '''
-    
-    # Get the corner points in the order we want
-    src_corners = get_quadrilateral_points_in_order(src_corners)
-    src_corners = src_corners.astype("float32")
-    tl, tr, br, bl = src_corners
-    
-    # Define the desired dimensions of the destination (warped) image (max_width, max_height)
-    # Calculate the width of the top and bottom edges, and take the maximum
-    bottom_width = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    top_width = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    max_width = max(int(bottom_width), int(top_width))
-
-    # Calculate the height of the left and right edges, and take the maximum
-    left_height = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    right_height = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    max_height = max(int(left_height), int(right_height))
-
-    # Define the set of points in the destination image that our four corners 
-    # from the input image should map to, such that we obtain a bird's eye view
-    dest_img_corners = np.array([[0+pad, 0+pad],
-                                 [max_width-1-pad, 0+pad],
-                                 [max_width-1-pad, max_height-1-pad],
-                                 [0+pad, max_height-1-pad]], dtype="float32")
-
-    # Compute our transformation matrix
-    M = cv2.getPerspectiveTransform(src=src_corners, dst=dest_img_corners)
-    warped_img = cv2.warpPerspective(input_img, M, (max_width, max_height))
-
-    return M, warped_img
+# --------------------------------------------------------------------------- #
+# Warping / grid analysis
+# --------------------------------------------------------------------------- #
+@dataclass
+class GridView:
+    M: np.ndarray            # source image -> warped image
+    warped: np.ndarray       # RGB, SIDE x SIDE
+    binary: np.ndarray       # white-on-black thresholded warped image
+    h_lines: np.ndarray      # horizontal line mask
+    v_lines: np.ndarray      # vertical line mask
+    hp: np.ndarray           # horizontal line coverage per row
+    vp: np.ndarray           # vertical line coverage per column
 
 
-def find_grid_contour_candidates(img, to_plot=False):
-    '''
-    Given an input image, build a list of contours that may represent the
-    main puzzle grid outline. For each candidate identified, perform a
-    perspective transformation and store the contour, the transformation
-    matrix, and the perspective-warped image.
-    
-    Args:
-        img: RGB image of sudoku puzzle.
-        to_plot: Flag to produce plot showing all contours.
-        
-    Returns:
-        contours: A list of contours identified as potential grid candidates.
-                    Sorted in reverse order by area of contour.
-        M: A list of perspective transformation matrices.
-        warped: A list of warped images that may represent the main puzzle grid.
-        
-    '''
-    
-    # Initialise lists for return values
-    M_matrices = []
-    warped_images = []
-    contour_grid_candidates = []
+def warp_grid(img, quad, k=0):
+    """Perspective-warp `quad` to a SIDE x SIDE square.
 
-    # Calculate the area of the whole image
-    img_area = img.shape[0] * img.shape[1]
-
-    # Apply blur, grayscale and adaptive threshold
-    thresh = apply_grayscale_blur_and_threshold(img, blocksize=41, c=8)
-
-    # Get the contours from the thresholded image
-    contours = cv2.findContours(image=thresh.copy(),
-                                mode=cv2.RETR_EXTERNAL,
-                                method=cv2.CHAIN_APPROX_SIMPLE)
-
-    if contours:
-        # Convenience function to extract contours
-        contours = imutils.grab_contours(contours)
-        # Sort the contours according to contour area, largest first
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        
-        if to_plot:
-            # Plot all the contours on the original RGB image
-            with_contours = cv2.drawContours(img.copy(), contours, -1, (0, 255, 75), thickness=2)
-            plt.imshow(with_contours)
-            plt.show(block=False)
-        
-        for contour in contours:
-            # Approximate the contour in order to determine whether the contour is a quadrilateral
-            perimeter = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
-            
-            # Calculate the area of the identified contour
-            contour_area = cv2.contourArea(contour)
-            contour_fractional_area = contour_area / img_area
-            
-            # We are looking for a quadrilateral contour with sufficiently large area
-            if len(approx) == 4 and contour_fractional_area > 0.1:
-                # Get the corners in the required order
-                approx = get_quadrilateral_points_in_order(approx)
-                # Use the approximation to apply the perspective transform
-                # on the candidate grid region
-                M, warped_img = perform_four_point_transform(input_img=img,
-                                                              src_corners=approx,
-                                                              pad=30)
-                
-                M_matrices.append(M)
-                warped_images.append(warped_img)
-                contour_grid_candidates.append(contour)
-                        
-    if warped_images:
-        return M_matrices, warped_images, contour_grid_candidates
-    else:
-        raise Exception("No grid contour candidates were found in image")
+    k rotates the corner assignment by k*90 degrees (used to try other
+    orientations of the puzzle).
+    """
+    quad = np.roll(order_corners(quad), -k, axis=0).astype(np.float32)
+    dst = np.float32([
+        [WARP_PAD, WARP_PAD],
+        [WARP_PAD + GRID_SIZE, WARP_PAD],
+        [WARP_PAD + GRID_SIZE, WARP_PAD + GRID_SIZE],
+        [WARP_PAD, WARP_PAD + GRID_SIZE],
+    ])
+    M = cv2.getPerspectiveTransform(quad, dst)
+    warped = cv2.warpPerspective(
+        img, M, (SIDE, SIDE), flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+    return M, warped
 
 
-def check_for_digit_in_cell_image(img, area_threshold=5, apply_border=False):
-    '''
-    Determine whether or not a digit is present in an image of a single
-    sudoku cell. If a contour is located whose area exceeds area_threshold,
-    it is determined that this contour represents a digit.
-    
-    Args:
-        img: An image of a single sudoku cell.
-        area_threshold: Threshold value whose units are percentage of image area.
-                        A contour is considered a digit if its area exceeds
-                        the threshold.
-                        
-        apply_border: Whether or not to apply a mask to remove non-digit pixels
-                      around the edges of the cell image.
-            
-    Returns:
-        image_contains_digit: Boolean - whether the cell is considered to contain a digit.
-        cell_img: Image of the sudoku cell, optionally with border masked out.
-    
-    '''
-    
-    cell_img = img.copy()
-    
-    if apply_border:
-        # Crude way to eliminate the unwanted pixels around the borders
-        border_fraction = 0.07
-        replacement_val = 0
-        
-        y_border_px = int(border_fraction * cell_img.shape[0])
-        x_border_px = int(border_fraction * cell_img.shape[1])
-        
-        cell_img[:, 0:x_border_px] = replacement_val
-        cell_img[:, -x_border_px:] = replacement_val
-        cell_img[0:y_border_px, :] = replacement_val
-        cell_img[-y_border_px:, :] = replacement_val
-    
-    # Get the contours for the image
-    contours = cv2.findContours(image=cell_img,
-                                mode=cv2.RETR_TREE,
-                                method=cv2.CHAIN_APPROX_SIMPLE)
-    contours = imutils.grab_contours(contours)
-    
-    if len(contours) > 0:
-        # Sort the contours according to contour area, largest first
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)        
-        largest_contour_area = cv2.contourArea(contours[0])
-        image_area = cell_img.shape[0] * cell_img.shape[1]
-        contour_percentage_area = 100 * largest_contour_area / image_area
-        
-        if contour_percentage_area > area_threshold:
-            image_contains_digit = True
+def binarize_warped(warped_rgb):
+    """Illumination-normalised adaptive threshold. Ink -> 255, paper -> 0."""
+    gray = cv2.cvtColor(warped_rgb, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41)))
+    norm = cv2.divide(gray, bg, scale=255)
+    return cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                 cv2.THRESH_BINARY_INV, 91, 7)
+
+
+def _line_masks_and_profiles(binary):
+    k = int(CELL_SIZE * 0.9)
+    h_lines = cv2.morphologyEx(
+        binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
+    v_lines = cv2.morphologyEx(
+        binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
+    side = binary.shape[0]
+    hp = h_lines.sum(axis=1) / (255.0 * side)
+    vp = v_lines.sum(axis=0) / (255.0 * side)
+    return h_lines, v_lines, hp, vp
+
+
+def analyse_grid(img, quad, k=0):
+    M, warped = warp_grid(img, quad, k)
+    binary = binarize_warped(warped)
+    h_lines, v_lines, hp, vp = _line_masks_and_profiles(binary)
+    return GridView(M, warped, binary, h_lines, v_lines, hp, vp)
+
+
+def _grid_score(hp, vp):
+    """How well do the line profiles match 10 + 10 evenly spaced lines? (0..1)"""
+    s = []
+    for prof in (hp, vp):
+        for i in range(10):
+            e = WARP_PAD + i * CELL_SIZE
+            lo = max(e - CELL_SIZE // 4, 0)
+            hi = min(e + CELL_SIZE // 4 + 1, len(prof))
+            s.append(min(1.0, float(prof[lo:hi].max()) / 0.45))
+    return float(np.mean(s))
+
+
+def _line_centres(profile):
+    if profile.max() <= 0.05:
+        return []
+    idx = np.flatnonzero(profile >= max(0.5 * profile.max(), 0.1))
+    if idx.size == 0:
+        return []
+    groups = np.split(idx, np.flatnonzero(np.diff(idx) > 2) + 1)
+    centres = []
+    for g in groups:
+        w = profile[g]
+        centres.append(float((g * w).sum() / w.sum()))
+    merged = []
+    for c in centres:
+        if merged and c - merged[-1] < 0.3 * CELL_SIZE:
+            merged[-1] = (merged[-1] + c) / 2
         else:
-            image_contains_digit = False
-        
-    else:
-        image_contains_digit = False
-        
-    return image_contains_digit, cell_img
+            merged.append(c)
+    return merged
 
 
-def locate_cells_within_grid(grid_img, to_plot=False):
-    '''
-    Identify the individual sudoku cells contained within the grid image.
-    
-    Args:
-        grid_img:
-        to_plot:
-            
-    Returns:
-        valid_cells:
-    
-    '''
-    
-    # Initialise a list to store the detected cells
-    valid_cells = []
-    
-    # Calculate the area of the sudoku grid.
-    # Used later to check if a contour is a valid cell
-    grid_area = grid_img.shape[0] * grid_img.shape[1]
-    
-    # Apply blur, grayscale and adaptive threshold
-    grid_img = apply_grayscale_blur_and_threshold(grid_img, method="mean", blocksize=91, c=7)
-    
-    if to_plot:
-        fig, ax = plt.subplots()
-        ax.imshow(grid_img, cmap='gray')
-        plt.show(block=False)
-    
-    # Get external and internal contours from the sudoku grid image
-    contours = cv2.findContours(image=grid_img.copy(),
-                                mode=cv2.RETR_TREE,
-                                method=cv2.CHAIN_APPROX_NONE)
-    
-    if contours:
-        # Convenience function to extract contours
-        contours = imutils.grab_contours(contours)
-        # Sort the contours according to contour area, largest first
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+def _outer_box(hp, vp):
+    """Position (warped coords) of the outermost grid lines, or None."""
+    cy, cx = _line_centres(hp), _line_centres(vp)
+    if len(cy) < 6 or len(cx) < 6:
+        return None
 
-        for contour in contours:
-            # Approximate the contour
-            perimeter = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
-            # Find the contour area wrt the grid area
-            contour_fractional_area = cv2.contourArea(contour) / grid_area
-            
-            # We are looking for a contour that is quadrilateral and has an area
-            # of approximately 1% of the grid area (0.5% to 1.5% works well)
-            if len(approx) == 4 and contour_fractional_area > 0.005 and contour_fractional_area < 0.015:
-                # We have found a valid contour
-                # Use a mask to extract the identified cell from grid_img
-                mask = np.zeros_like(grid_img)
-                # Use the contour to mask out the cell
-                cv2.drawContours(image=mask,
-                                contours=[contour],
-                                contourIdx=0,
-                                color=255,
-                                thickness=cv2.FILLED)
-                
-                # Get the indices where the mask is white
-                y_px, x_px = np.where(mask==255)
-                # Use these indices to crop out the cell from the image
-                cell_image = grid_img[min(y_px):max(y_px)+1, min(x_px):max(x_px)+1]
-                # Determine whether or not there's a digit present in the cell
-                digit_is_present, cell_image = check_for_digit_in_cell_image(img=cell_image,
-                                                                             area_threshold=5,
-                                                                             apply_border=True)
-                
-                # See if erosion improves predictions
-                kernel = np.ones((3, 3), np.uint8)
-                cell_image = cv2.erode(cell_image, kernel, iterations=1)
-                
-                # Resize the cell image to be 28x28 pixels for classification later
-                cell_image = cv2.resize(cell_image, dsize=(28, 28), interpolation=cv2.INTER_AREA)
-                
-                # Use the contour to calculate the centroid for the cell. This is
-                # so we know the cell's location on the grid, so we know where to
-                # place the text when entering the puzzle solution
-                moments = cv2.moments(contour)
-                x_centroid = int(moments['m10'] / moments['m00'])
-                y_centroid = int(moments['m01'] / moments['m00'])
-    
-                # Create a dictionary for every valid cell
-                valid_cells.append({'img': cell_image,
-                                    'contains_digit': digit_is_present,
-                                    'x_centroid': x_centroid,
-                                    'y_centroid': y_centroid})
-                        
-    else:
-        print("No valid cells found in image")
-    
-    return valid_cells
+    def span_ok(c):
+        sp = np.median(np.diff(c))
+        return sp > 0 and 7.5 <= (c[-1] - c[0]) / sp <= 10.5
 
-    
-def get_valid_cells_from_image(img):
-    '''
-    The aim is to locate and extract the puzzle grid from an image.
-    First, identify all candidates for the puzzle grid, then search within
-    these candidates for valid individual grid cells. If no candidate puzzle
-    grid contains exactly 81 cells, the search has failed and an exception
-    is raised.
-    
-    Args:
-        img: RGB image of a sudoku puzzle.
-            
-    Returns:
-        valid_cells: A list of dictionary objects, one for each cell.
-                     These contain the cell's image data, whether or not it
-                     contains a digit, and the cell's x- and y-centroids in
-                     the perspective warped image.
-        
-        M: The perspective transform matrix used to transform the identified
-            grid to the bird's-eye view. This will be used for inverse
-            transform when placing solved digits back on the original grid image.
-            
-        
-        grid_image: The perspective transformed puzzle grid, isolated from the rest
-                    of the image.
-            
-    '''
-    # Find grid contour candidates for a particular image
-    M_matrices, warped_images, grid_candidates = find_grid_contour_candidates(img)
-    
-    if not warped_images:
-        raise Exception("No grid candidates were found in the image.")
-    
-    # For each candidate grid, check if it's valid and get inverse transform matrix
-    for i, grid_image in enumerate(warped_images):
-        valid_cells = locate_cells_within_grid(grid_image)
-        M = M_matrices[i]
-        if len(valid_cells) == 81:
-            # Assume we have found the puzzle grid
-            valid_cells = sort_cells_into_grid(valid_cells)
-            #plot_cell_images_in_grid(valid_cells)
-            return valid_cells, M, grid_image
-    
-    # If we don't obtain a list of valid cells, we don't return anything
-    raise Exception("Unable to find the required number of cells in image.")
+    if not (span_ok(cy) and span_ok(cx)):
+        return None
+    return cx[0], cy[0], cx[-1], cy[-1]
 
 
-def sort_cells_into_grid(cells):
-    '''
-    Given a list of cells, use the x and y centroid values to arrange the
-    cells into the same order as the original puzzle grid (left to right,
-    top to bottom). This sorted list is used later to construct a 2D numpy
-    array representing the board, which is passed to a solver.
-    
-    Each cell is a dictionary containing the cell image, and x- and y-centroids.
-    
-    Args:
-        cells: List of dictionary objects, each containing cell information.
-    
-    Returns:
-        sorted_cells_list: List of cell dictionaries, sorted such that the
-                            cells are in the same order as the original puzzle
-                            grid (left to right, top to bottom).
-    
-    '''
-    
-    x_vals = [cell['x_centroid'] for cell in cells]
-    y_vals = [cell['y_centroid'] for cell in cells]
-    
-    # Get a 2D array of all x, y points from the dictionary
-    points = np.array([[cell['x_centroid'], cell['y_centroid']] for cell in cells])
-    # Sort by x value
-    points_sorted = np.array(sorted(points, key=lambda x: x[1]))
-    # Reshape to give an array with 9 rows
-    rows = np.reshape(points_sorted, shape=(9, 9, 2))
-    # Sort by y value for every row in rows
-    final = np.array([sorted(row, key=lambda x: x[0]) for row in rows])
-    
-    # Make sure all value combinations in final are actually present in the dictionary
-    final_reshaped = np.reshape(final, shape=(81, 2))
-    for i in range(len(x_vals)):
-        assert any(np.equal(final_reshaped, [x_vals[i], y_vals[i]]).all(1))
-        
-    # Find the index of the cell in cells (list) for each point in final_reshaped
-    indices = []
-    for x, y in final_reshaped:
-        x_indices = np.where(np.array(x_vals) == x)
-        y_indices = np.where(np.array(y_vals) == y)
-        index = np.intersect1d(x_indices, y_indices)[0]
-        indices.append(index)
-    
-    # Sort the cells list according to the indices list
-    sorted_cells_list = [cells[idx] for idx in indices]
-    return sorted_cells_list
+def refine_quad(img, quad, iters=2):
+    """Tighten/loosen a quad so that its edges sit on the outer grid lines.
+    Returns (best_quad, best_score)."""
+    q = np.asarray(quad, np.float32)
+    best_q, best_score = q.copy(), -1.0
+    for it in range(iters + 1):
+        view = analyse_grid(img, q)
+        score = _grid_score(view.hp, view.vp)
+        if score > best_score:
+            best_q, best_score = q.copy(), score
+        if it == iters:
+            break
+        box = _outer_box(view.hp, view.vp)
+        if box is None:
+            break
+        x0, y0, x1, y1 = box
+        lo, hi = WARP_PAD, WARP_PAD + GRID_SIZE
+        if max(abs(x0 - lo), abs(y0 - lo), abs(x1 - hi), abs(y1 - hi)) <= 3:
+            break
+        dst = np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+        q = cv2.perspectiveTransform(dst[None], np.linalg.inv(view.M))[0].astype(np.float32)
+    return best_q, best_score
 
 
-def plot_cell_images_in_grid(cells):
-    '''
-    A quick utility function to take all the cell images from a list and plot
-    them in a grid in the same layout as the original puzzle.
-    
-    Args:
-        cells: List of dictionary objects, each containing one cell image.
-    
-    '''
-    # Create a blank image (cell images have side 28px)
-    width, height = 9*28, 9*28
-    main_img = np.zeros((height, width))
-    
-    for i, cell in enumerate(cells):
-        # Get row and col of cell, used to determine position in main_img
-        row, col = np.array(divmod(i, 9))
-        # Make a copy of the cell image and place it on main_img
-        cell_image = cells[i]['img'].copy()
-        main_img[row*28:(row+1)*28, col*28:(col+1)*28] = cell_image
-    
-    fig, ax = plt.subplots()
-    ax.imshow(main_img, cmap='gray')
-    plt.show(block=False)
+def _refine_positions(prof):
+    """Positions of the 10 grid lines along one axis (snapped to detected
+    lines when possible, otherwise the nominal position)."""
+    nominal = np.array([WARP_PAD + i * CELL_SIZE for i in range(10)], dtype=float)
+    pos = []
+    for i in range(10):
+        e = int(nominal[i])
+        lo = max(e - CELL_SIZE // 4, 0)
+        hi = min(e + CELL_SIZE // 4 + 1, len(prof))
+        seg = prof[lo:hi]
+        j = int(np.argmax(seg))
+        if seg[j] < 0.2:
+            pos.append(float(e))
+            continue
+        c = lo + j
+        a, b = max(c - 4, 0), min(c + 5, len(prof))
+        w = prof[a:b]
+        pos.append(float((np.arange(a, b) * w).sum() / w.sum()))
+    pos = np.array(pos)
+    d = np.diff(pos)
+    if np.any(d < 0.6 * CELL_SIZE) or np.any(d > 1.4 * CELL_SIZE):
+        return nominal
+    return pos
 
 
-# This was previously called get_cell_predictions
+# --------------------------------------------------------------------------- #
+# Grid candidate search
+# --------------------------------------------------------------------------- #
+@dataclass
+class GridCandidate:
+    quad: np.ndarray
+    score: float
+
+
+def _threshold_variants(gray):
+    blur3 = cv2.GaussianBlur(gray, (3, 3), 0)
+    blur5 = cv2.GaussianBlur(gray, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(blur3)
+
+    out = [
+        cv2.adaptiveThreshold(blur3, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                              cv2.THRESH_BINARY_INV, 41, 8),       # original setting
+        cv2.adaptiveThreshold(blur5, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                              cv2.THRESH_BINARY_INV, 31, 6),
+        cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                              cv2.THRESH_BINARY_INV, 51, 10),
+        cv2.threshold(blur5, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1],
+        cv2.dilate(cv2.Canny(blur5, 30, 100), np.ones((3, 3), np.uint8)),
+    ]
+    k5 = np.ones((5, 5), np.uint8)
+    # Closing bridges small gaps in broken grid lines
+    return [cv2.morphologyEx(v, cv2.MORPH_CLOSE, k5) for v in out]
+
+
+def _quad_from_contour(contour):
+    hull = cv2.convexHull(contour)
+    if len(hull) < 4:
+        return None
+    peri = cv2.arcLength(hull, True)
+    for eps in (0.01, 0.02, 0.03, 0.045):
+        approx = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype(np.float32)
+    # Fallback: minimum-area rectangle if the hull is nearly rectangular
+    hull_area = cv2.contourArea(hull)
+    rect = cv2.minAreaRect(hull)
+    rw, rh = rect[1]
+    if rw * rh > 0 and hull_area / (rw * rh) > 0.85:
+        return cv2.boxPoints(rect).astype(np.float32)
+    return None
+
+
+def _quad_ok(q, img_area):
+    pts = q.reshape(-1, 1, 2).astype(np.float32)
+    if cv2.contourArea(pts) < MIN_GRID_FRACTION * img_area:
+        return False
+    if not cv2.isContourConvex(pts):
+        return False
+    d = [float(np.linalg.norm(q[i] - q[(i + 1) % 4])) for i in range(4)]
+    if min(d) < 10:
+        return False
+    w, h = (d[0] + d[2]) / 2, (d[1] + d[3]) / 2
+    return 0.5 < w / h < 2.0
+
+
+def _same_quad(a, b, tol):
+    return float(np.max(np.linalg.norm(a - b, axis=1))) < tol
+
+
+def find_grid_candidates(img_pad, max_candidates=4, max_eval=12):
+    """Return (candidates sorted by score, best_score_seen)."""
+    h, w = img_pad.shape[:2]
+    img_area = float(h * w)
+    diag = math.hypot(h, w)
+    gray = cv2.cvtColor(img_pad, cv2.COLOR_RGB2GRAY)
+
+    raw = []
+    for bin_img in _threshold_variants(gray):
+        contours = _find_contours(bin_img, cv2.RETR_LIST)
+        areas = [(cv2.contourArea(c), c) for c in contours if len(c) >= 4]
+        areas.sort(key=lambda t: t[0], reverse=True)
+        for area, c in areas[:10]:
+            if area < MIN_GRID_FRACTION * img_area:
+                break
+            quad = _quad_from_contour(c)
+            if quad is None:
+                continue
+            quad = order_corners(quad)
+            if _quad_ok(quad, img_area):
+                raw.append(quad)
+
+    # Whole-image fallbacks: the picture may be a tight crop of the grid
+    p = IMG_PAD
+    W0, H0 = w - 2 * p, h - 2 * p
+    for inset in (0.0, 0.02):
+        dx, dy = inset * W0, inset * H0
+        raw.append(np.float32([
+            [p + dx, p + dy], [p + W0 - 1 - dx, p + dy],
+            [p + W0 - 1 - dx, p + H0 - 1 - dy], [p + dx, p + H0 - 1 - dy]]))
+
+    uniq = []
+    for q in raw:
+        if all(not _same_quad(q, u, 0.02 * diag) for u in uniq):
+            uniq.append(q)
+    uniq.sort(key=lambda q: cv2.contourArea(q.reshape(-1, 1, 2)), reverse=True)
+
+    scored = [(sc, rq) for rq, sc in (refine_quad(img_pad, q) for q in uniq[:max_eval])]
+    scored.sort(key=lambda t: -t[0])
+    best_seen = scored[0][0] if scored else 0.0
+
+    out = []
+    for sc, q in scored:
+        if sc < MIN_GRID_SCORE:
+            break
+        if any(_same_quad(q, c.quad, 0.02 * diag) for c in out):
+            continue
+        out.append(GridCandidate(q, sc))
+        if len(out) >= max_candidates:
+            break
+    return out, best_seen
+
+
+# --------------------------------------------------------------------------- #
+# Cell extraction and digit recognition
+# --------------------------------------------------------------------------- #
+def _process_cell(crop):
+    """Return (contains_digit, 28x28 uint8 image: white digit on black)."""
+    blank = np.zeros((28, 28), np.uint8)
+    h, w = crop.shape[:2]
+    if h < 8 or w < 8:
+        return False, blank
+
+    m = max(2, int(round(CELL_BORDER_FRACTION * min(h, w))))
+    cell = crop.copy()
+    cell[:m, :] = 0
+    cell[h - m:, :] = 0
+    cell[:, :m] = 0
+    cell[:, w - m:] = 0
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(cell, connectivity=8)
+    keep = np.zeros_like(cell)
+    best_area, best_h = 0, 0
+    for lab in range(1, n):
+        x, y, cw, ch, area = stats[lab]
+        if area < 0.004 * h * w:                       # noise
+            continue
+        touches = x <= m or y <= m or x + cw >= w - m or y + ch >= h - m
+        fill = area / float(cw * ch)
+        aspect = max(cw / float(ch), ch / float(cw))
+        if touches and (fill < 0.2 or aspect > 4.0):   # leftover grid-line pieces
+            continue
+        keep[labels == lab] = 255
+        if area > best_area:
+            best_area, best_h = area, ch
+
+    present = best_area >= 0.015 * h * w and best_h >= 0.3 * h
+    if not present:
+        return False, blank
+
+    keep = cv2.erode(keep, np.ones((3, 3), np.uint8), iterations=1)
+    return True, cv2.resize(keep, (28, 28), interpolation=cv2.INTER_AREA)
+
+
+def extract_cells(view):
+    """Slice the warped grid into 81 cells (row-major order)."""
+    xs = _refine_positions(view.vp)
+    ys = _refine_positions(view.hp)
+
+    # Erase the grid lines so they cannot be mistaken for digits
+    lines = cv2.dilate(cv2.bitwise_or(view.h_lines, view.v_lines),
+                       np.ones((3, 3), np.uint8))
+    clean = view.binary.copy()
+    clean[lines > 0] = 0
+
+    cells = []
+    for i in range(9):
+        for j in range(9):
+            y0, y1 = int(round(ys[i])), int(round(ys[i + 1]))
+            x0, x1 = int(round(xs[j])), int(round(xs[j + 1]))
+            present, img28 = _process_cell(clean[y0:y1, x0:x1])
+            cells.append({
+                "img": img28,
+                "contains_digit": present,
+                "x_centroid": (xs[j] + xs[j + 1]) / 2.0,
+                "y_centroid": (ys[i] + ys[i + 1]) / 2.0,
+            })
+    return cells
+
+
+def read_board(model, cells):
+    """Classify digit cells. Returns (board 9x9, digit_cell_indices, scores)."""
+    digit_idx = [i for i, c in enumerate(cells) if c["contains_digit"]]
+    board = np.zeros(81, dtype=int)
+    scores = None
+    if digit_idx:
+        x = np.array([cells[i]["img"][..., None] for i in digit_idx], dtype=np.float32)
+        scores = np.asarray(model.predict(x))
+        board[digit_idx] = np.argmax(scores, axis=1) + 1
+    return board.reshape(9, 9), digit_idx, scores
+
+
+# Kept for backwards compatibility with the previous API
 def get_predicted_sudoku_grid(model, cells):
-    '''
-    Use a model to make predictions about which digit is present in each cell
-    containing a digit. Use these predictions to construct a 2D array 
-    representing the sudoku board, where blank squares are assigned a value of 0.
-    
-    Args:
-        model: A model for classifying digits 1 to 9 in images (any object
-                exposing a Keras-like predict() method, e.g. OnnxModel).
-        cells: A 1D list of cells sorted in the same order as in the puzzle,
-                read left to right, top to bottom.
-            
-    Returns:
-        grid_array: A 2D array representing the sudoku board, containing
-                    the predicted digits and using zeros for empty cells.
-    
-    '''
-    # Extract the digit images from the list of identified cells
-    digit_images = np.array([np.expand_dims(cell['img'], -1) for cell in cells if cell['contains_digit']], dtype=np.float32)
-    # Predict the digit in each image
-    pred_labels = model.predict(digit_images)
-    pred_labels = np.argmax(pred_labels, axis=1) + 1
-    # Construct a sudoku grid containing digit classification predictions
-    indices = np.where([cell['contains_digit'] for cell in cells])[0]
-    grid_array = np.zeros((81), dtype=int)
-    grid_array[indices] = pred_labels
-    grid_array = np.reshape(grid_array, shape=(9, 9))
-    return grid_array
+    return read_board(model, cells)[0]
 
 
-def generate_solution_image(full_image, board_image, cells_list, solved_board_arr, M_matrix):
-    '''
-    Annotate the original image of the sudoku board with the solution.
-    
-    Args:
-        full_image:
-        board_image:
-        cells_list:
-        solved_board_arr:
-        M_matrix:
-        
-    Returns:
-        annotated: Original RGB puzzle image, annotated with solutions.
-    
-    '''
-    
-    # Specify the font used for annotating the solutions
+def solve_with_corrections(board, digit_idx, scores, t_end, max_weak=12, pair_pool=6):
+    """Solve `board`. If it is inconsistent / unsolvable, retry after replacing
+    the least-confident digits by their 2nd-best class (1 or 2 at a time)."""
+
+    def attempt(b, per_try):
+        if not SudokuSolver.is_board_valid(b):
+            return None
+        remaining = t_end - time.monotonic()
+        if remaining <= 0:
+            return None
+        s = SudokuSolver(b.copy(), timeout=min(per_try, remaining))
+        return s.board if s.solve() else None
+
+    res = attempt(board, 4.0)
+    if res is not None or scores is None or len(digit_idx) == 0:
+        return res
+
+    scores = np.asarray(scores)
+    if scores.shape[1] < 2:
+        return None
+    order = np.argsort(scores, axis=1)
+    rows = np.arange(len(scores))
+    best, second = order[:, -1], order[:, -2]
+    margin = scores[rows, best] - scores[rows, second]
+    weak = [int(i) for i in np.argsort(margin)[:max_weak]]
+    flat = board.reshape(-1)
+
+    def with_changes(changes):
+        b = flat.copy()
+        for w in changes:
+            b[digit_idx[w]] = second[w] + 1
+        return b.reshape(9, 9)
+
+    for w in weak:
+        res = attempt(with_changes([w]), 1.5)
+        if res is not None:
+            return res
+    for a, b in combinations(weak[:pair_pool], 2):
+        res = attempt(with_changes([a, b]), 1.5)
+        if res is not None:
+            return res
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
+def generate_solution_image(full_image, cells, solved_board, M, color=(255, 15, 0)):
+    """Draw the solved digits (only in originally empty cells) onto the image.
+
+    M must map full_image coordinates -> warped grid coordinates.
+    """
     font = cv2.FONT_HERSHEY_SIMPLEX
-    
-    # Create a white grid the same shape as the warped image, to place solutions
-    solution_img = np.ones_like(board_image) * 255
-    # Flatten the solved 2D board array
-    flattened_board_array = solved_board_arr.reshape((-1))
-    
-    # Place the solved digits from blank puzzle cells on the blank white image
-    for i, cell in enumerate(cells_list):
-        if not cell['contains_digit']:
-            # Get cell centroids for text positioning
-            x_pos = cell['x_centroid']
-            y_pos = cell['y_centroid']
-            text = str(flattened_board_array[i])
-            textsize = cv2.getTextSize(text, font, 1, 2)[0]
-            # Specify placement of text
-            text_x = int((x_pos - textsize[0] / 2))
-            text_y = int((y_pos + textsize[1] / 2))
-            # Annotate number with black text
-            cv2.putText(solution_img, text, (text_x, text_y), font, 1.3, (0, 0, 0), 2)
-    
-    # Apply the inverse perspective transform to the solution image
-    unwarped_img = cv2.warpPerspective(
-        solution_img,
-        M_matrix,
-        (full_image.shape[1], full_image.shape[0]),
-        flags=cv2.WARP_INVERSE_MAP,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(255, 255, 255)
-    )
-    
-    # Copy original image to annotate with the solution digits
-    annotated = full_image.copy()
-    # Locate black pixels (number text) and change colour to red
-    annotated[np.where(unwarped_img[:,:,0] == 0)] = (255, 15, 0)
-    
-    return annotated
+    base_h = cv2.getTextSize("8", font, 1.0, 1)[0][1]
+    scale = CELL_SIZE * 0.55 / base_h
+    thickness = max(2, int(round(CELL_SIZE / 28)))
+
+    mask = np.zeros((SIDE, SIDE), dtype=np.uint8)
+    flat = np.asarray(solved_board).reshape(-1)
+    for i, cell in enumerate(cells):
+        if cell["contains_digit"]:
+            continue
+        text = str(int(flat[i]))
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+        org = (int(round(cell["x_centroid"] - tw / 2.0)),
+               int(round(cell["y_centroid"] + th / 2.0)))
+        cv2.putText(mask, text, org, font, scale, 255, thickness, cv2.LINE_AA)
+
+    h, w = full_image.shape[:2]
+    unwarped = cv2.warpPerspective(mask, M, (w, h),
+                                   flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    alpha = (unwarped.astype(np.float32) / 255.0)[..., None]
+    out = full_image.astype(np.float32) * (1 - alpha) + np.array(color, np.float32) * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def draw_debug_image(view, cells, board):
+    """Warped grid with detected lines and the digits that were read."""
+    img = view.warped.copy()
+    for x in _refine_positions(view.vp):
+        cv2.line(img, (int(x), 0), (int(x), SIDE - 1), (0, 200, 0), 1)
+    for y in _refine_positions(view.hp):
+        cv2.line(img, (0, int(y)), (SIDE - 1, int(y)), (0, 200, 0), 1)
+    for idx, c in enumerate(cells):
+        if c["contains_digit"]:
+            r, cc = divmod(idx, 9)
+            cv2.putText(img, str(int(board[r][cc])),
+                        (int(c["x_centroid"]) - 12, int(c["y_centroid"]) + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 2, cv2.LINE_AA)
+    return img
+
+
+# --------------------------------------------------------------------------- #
+# High-level entry point
+# --------------------------------------------------------------------------- #
+@dataclass
+class SolveResult:
+    annotated: Optional[np.ndarray] = None
+    message: str = ""
+    debug_image: Optional[np.ndarray] = None
+
+    @property
+    def ok(self):
+        return self.annotated is not None
+
+
+def solve_sudoku_image(model, img_rgb, time_budget=20.0):
+    """Detect, read and solve the sudoku in an RGB image.
+
+    Never raises for "normal" failures; inspect the returned SolveResult.
+    """
+    t_end = time.monotonic() + time_budget
+    p = IMG_PAD
+    img_pad = cv2.copyMakeBorder(img_rgb, p, p, p, p, cv2.BORDER_CONSTANT,
+                                 value=(255, 255, 255))
+
+    candidates, best_seen = find_grid_candidates(img_pad)
+    if not candidates:
+        return SolveResult(message=f"no sudoku grid found (best grid score {best_seen:.2f})")
+
+    # original image -> padded image
+    T = np.array([[1, 0, p], [0, 1, p], [0, 0, 1]], dtype=np.float64)
+
+    debug = None
+    notes = []
+    for ci, cand in enumerate(candidates):
+        for k in range(4):                      # 0/90/180/270 degree orientations
+            if time.monotonic() > t_end:
+                return SolveResult(message="time budget exceeded", debug_image=debug)
+
+            view = analyse_grid(img_pad, cand.quad, k)
+            cells = extract_cells(view)
+            board, digit_idx, scores = read_board(model, cells)
+            if ci == 0 and k == 0:
+                debug = draw_debug_image(view, cells, board)
+
+            if len(digit_idx) < MIN_GIVENS:
+                notes.append(f"cand{ci}/rot{90 * k}: only {len(digit_idx)} digits")
+                continue
+
+            solved = solve_with_corrections(board, digit_idx, scores, t_end)
+            if solved is None:
+                notes.append(f"cand{ci}/rot{90 * k}: {len(digit_idx)} digits, unsolvable")
+                continue
+
+            M_orig = view.M @ T
+            annotated = generate_solution_image(img_rgb, cells, solved, M_orig)
+            return SolveResult(
+                annotated=annotated,
+                message=f"solved (grid score {cand.score:.2f}, rotation {90 * k} deg, "
+                        f"{len(digit_idx)} givens)")
+
+    return SolveResult(
+        message="grid found but puzzle could not be solved; " + "; ".join(notes[:4]),
+        debug_image=debug)
