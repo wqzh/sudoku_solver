@@ -1,4 +1,12 @@
-python-opencv
-onnxruntime
-numpy
+# app/ 目录（Web 版数独求解器）运行所需依赖
+# 安装：pip install -r app/requirements.txt
+#
+# GPU 推理：把 onnxruntime 换成 onnxruntime-gpu（二选一，不要同时安装），
+# 程序会自动检测 CUDAExecutionProvider，检测不到则回退 CPU。
 
+fastapi>=0.100
+uvicorn>=0.23
+python-multipart>=0.0.6    # FastAPI 接收上传文件（UploadFile / File）必需，缺失会导致 /api/solve 报错
+numpy>=1.23
+opencv-python>=4.7         # 注意：不是 python-opencv（PyPI 上那个是空壳包）
+onnxruntime>=1.15

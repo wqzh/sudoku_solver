@@ -33,8 +33,9 @@ import detector as detector_mod          # noqa: E402
 import pipeline                           # noqa: E402
 import sudoku_utils as sutils             # noqa: E402
 
-DIGIT_MODEL_PATH = os.path.join(PROJECT_ROOT, "src_onnx", "model.onnx")
-DET_MODEL_PATH = os.path.join(PROJECT_ROOT, "det_model", "best.onnx-quant-ir9.onnx")
+# DIGIT_MODEL_PATH = os.path.join(PROJECT_ROOT, "src_onnx", "model.onnx")
+DIGIT_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "digit_recognize_model.onnx")
+DET_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "best.onnx-quant-ir9.onnx")
 STATIC_DIR = os.path.join(APP_DIR, "static")
 
 app = FastAPI(title="Sudoku Solver", version="1.0.0")

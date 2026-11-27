@@ -1,34 +1,83 @@
-.test_input/
-
-
-# Python
+# ===================== Python =====================
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+*.pyd
 *.egg-info/
+.eggs/
+build/
+sdist/
 .venv/
 venv/
+env/
+ENV/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 
-# 运行时
+# ===================== 运行时产物 / 本地数据 =====================
 data/
 data-local/
+.test_input/
 *.log
 .env
+.env.*
 
-# IDE / OS
+# ===================== IDE / 操作系统 =====================
 .idea/
 .vscode/
+*.swp
 .DS_Store
+Thumbs.db
+desktop.ini
 
-# 构建产物与依赖（dt2 追加）
+# ===================== 模型大文件 =====================
+# 部署只用到量化后的模型：
+#   det_model/best.onnx-quant-ir9.onnx   （棋盘检测，量化）
+#   det_model/digit_recognize_model.onnx （数字识别）
+# 训练权重与未量化导出体积大（各 >10MB），新建时自动忽略。
+# 注意：det_model/best.pt 已被历史提交跟踪，只加规则不会让它移出版本库，
+# 若确实要排除，需要执行：git rm --cached det_model/best.pt
+# det_model/best.pt
+# det_model/best.onnx
+# det_model/best.onnx.data
+# det_model/yolov8-best.onnx
+# det_model/yolov8-best.onnx.data
+# *.onnx.data
+
+# ===================== mobile/（Capacitor 手机端，整体不入库）=====================
+# 移动端项目约 310MB，主要是依赖与构建产物，且当前不是提交内容。
+# 若以后需要只保留源码，可删掉下面一行，改用其后的按目录排除规则。
+# mobile/
+
+# —— 供参考：只保留源码、排除依赖与构建产物的写法 ——
+mobile/node_modules/
+mobile/dist/
+mobile/vendor/
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/capacitor-cordova-android-plugins/build/
+mobile/android/local.properties
+mobile/android/.idea/
+mobile/android/.cxx/
+mobile/android/*.iml
+mobile/android/app/src/main/assets/public/
+mobile/android/app/src/main/assets/capacitor.config.json
+mobile/android/app/src/main/assets/capacitor.plugins.json
+mobile/artifacts/
+mobile/test/*.png
+
+# ===================== 其他构建产物 =====================
 node_modules/
 dist/
 target/
 *.jar
-.venv/
-__pycache__/
-*.pyc
 .turbo/
 .pnpm-store/
 coverage/
+*.apk
+*.aab
+*.zip
