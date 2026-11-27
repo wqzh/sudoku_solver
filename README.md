@@ -1,4 +1,4 @@
-[中文](README.md)|[English](README_EN.md)
+[中文](README.md) | [English](README_EN.md)
 
 # Sudoku Solver · 数独识别与求解
 
@@ -34,10 +34,16 @@ sudoku_solver/
 │   ├── onnx_quant_ir9.py           # ONNX 量化（IR9）
 │   └── load_onnx_ir9_det.py        # 量化检测模型的加载/推理参考实现
 ├── misc/                       # 历史版本与实验代码（src_tf / src_onnx、YOLO 导出笔记）
-└── mobile/                     # Capacitor 手机端（未纳入版本库，见 .gitignore）
+└── mobile/                     # 手机端：纯前端 PWA + Capacitor Android（未纳入版本库，见 .gitignore）
+   ├── index.html               # 应用入口
+   ├── src/core/                # 纯算法：检测、透视、切格、识别、求解（无 UI 依赖）
+   ├── src/app/                 # 界面与状态管理
+   ├── models/                  # 手机端用的两个量化 onnx 权重 + manifest.json
+   ├── scripts/build-web.mjs    # 生成 Capacitor 用的 dist/ 目录
+   └── android/                 # Capacitor 生成的 Android 工程
 ```
 
-> `mobile/` 为独立的手机端工程（Capacitor + Android），体积较大且不属于本仓库提交内容，已在 `.gitignore` 中整体排除。
+> `mobile/` 为独立的手机端工程（Capacitor + Android），体积较大且不属于本仓库提交内容，已在 `.gitignore` 中整体排除；源码与说明保留在本地工作区的该目录内。
 
 ## 环境要求
 
@@ -97,11 +103,43 @@ python app/server.py --host 127.0.0.1 --port 8000
 
 失败时 `ok=false`，`message` 给出原因（未检测到网格 / 识别数字不足 17 个 / 无解 / 超时等），HTTP 状态码仍可能为 200，前端按 `ok` 判断即可。
 
+## 手机端（mobile/）
+
+与 Web 版功能对齐的**纯前端移动端应用**：拍照或选图 → 检测棋盘 → 识别数字 → 求解 → 把答案叠回原图。
+推理全部在浏览器/WebView 内用 `onnxruntime-web`（WASM）完成，**没有后端服务，断网也能用**。
+
+**功能**
+
+- 相册 / 拍照导入（`<input capture>`，也可拖拽），内置「示例题」一键体验
+- 求解过程有进度提示，失败时给出明确原因（未检测到网格 / 识别数字不足 17 个 / 无解 / 超时）
+- 结果双视图切换：**答案图**（红色数字叠在原图上）与**盘面**（9×9 表格 + 统计信息）
+- 一键保存答案图片
+- 同一对模型随包分发：`models/grid_detector_yolov8n_640_int8.onnx`（3.28 MB）、`models/digit_classifier_28x28.onnx`（132 KB），合计约 3.4 MB
+
+**实现方式**
+
+- `src/core/` 用原生 JS 重写了 `app/pipeline.py` 的算法：YOLOv8 前后处理 + NMS、四边形排序与透视变换、81 格切分与网格线擦除、28×28 掩膜识别、位运算回溯求解与「低置信度数字换次优类别」纠错重试、四个旋转方向尝试。
+- 移动端直接用检测模型给出的四边形，省掉桌面版的经典轮廓搜索；**不引入 OpenCV.js**（约 8 MB），透视与切格用 Canvas + 类型化数组实现。
+- 前端界面无需构建：`index.html` + `assets/` + `src/` 直接可跑；`node scripts/build-web.mjs` 会把可运行文件（含 `models/`）拷进 `dist/` 供 Capacitor 打包。
+- Android 壳由 Capacitor 生成（应用 ID `com.nextwork.sudoku`，应用名「数独识别求解」）。
+
+**本地预览**（在 `mobile/` 目录内）
+
+```bash
+npm install          # 安装 onnxruntime-web 与 Capacitor 依赖
+npm start            # node server.mjs，按提示在浏览器打开
+```
+
+打包 Android：先执行 `node scripts/build-web.mjs` 把前端与模型拷进 `dist/`，再用 Capacitor 同步并构建 Android 工程（`mobile/android/` 已生成，具体口径见 `mobile/README.md`）。
+
+**验收口径**：对同一张测试图（`../.test_input/15.jpg`）的输出应与 `mobile/docs/baseline.json` 记录的 Python 版结果一致——网格得分 0.9935、旋转 0°、25 个已知数字。
+
+> 移动端是独立工程，未纳入本仓库提交内容；上述命令仅作说明，请在其自身环境中验证。
+
 ## 命令行批量版
 
 ```bash
-python main.py --input_dir ./samples --output_dir ./out \
-               --model_fpath models/digit_recognize_model.onnx
+python main.py --model_fpath models/digit_recognize_model.onnx --input_dir ./samples --output_dir ./out
 ```
 
 | 参数 | 说明 |

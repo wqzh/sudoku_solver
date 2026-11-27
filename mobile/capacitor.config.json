@@ -1,0 +1,12 @@
+{
+  "appId": "com.nextwork.sudoku",
+  "appName": "数独识别求解",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": true,
+    "webContentsDebuggingEnabled": true
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

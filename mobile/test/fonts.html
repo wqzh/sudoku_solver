@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>font probe</title></head>
+<body><pre id="out">…</pre>
+<script src="/vendor/ort/ort.wasm.min.js"></script>
+<script type="module">
+import { createEngine } from "/src/core/pipeline.js";
+import { analyseGrid, IMG_PAD, refineQuad } from "/src/core/grid.js";
+import { extractCells } from "/src/core/cells.js";
+
+ort.env.wasm.wasmPaths = "/vendor/ort/";
+ort.env.wasm.numThreads = 1;
+
+function makeGrid(font, weight, size) {
+  const margin = 46, cell = 84, side = margin * 2 + cell * 9;
+  const c = document.createElement("canvas");
+  c.width = side; c.height = side;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, side, side);
+  ctx.strokeStyle = "#111"; ctx.lineCap = "square";
+  for (let i = 0; i <= 9; i++) {
+    const p = margin + i * cell;
+    ctx.lineWidth = i % 3 === 0 ? 5 : 2;
+    ctx.beginPath(); ctx.moveTo(margin, p); ctx.lineTo(margin + cell * 9, p);
+    ctx.moveTo(p, margin); ctx.lineTo(p, margin + cell * 9); ctx.stroke();
+  }
+  ctx.fillStyle = "#111";
+  ctx.font = `${weight} ${size}px "${font}", serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (let d = 1; d <= 9; d++) {
+    ctx.fillText(String(d), margin + (d - 1) * cell + cell / 2, margin + cell / 2 + 2);
+  }
+  return c;
+}
+
+window.__run = async () => {
+  const engine = await createEngine({
+    detectorUrl: "/models/grid_detector_yolov8n_640_int8.onnx",
+    digitUrl: "/models/digit_classifier_28x28.onnx",
+  });
+  const fonts = ["Segoe UI", "Arial", "Times New Roman", "Georgia", "Verdana", "Tahoma",
+                 "Consolas", "Courier New", "Calibri", "Cambria", "Microsoft YaHei", "SimHei",
+                 "Trebuchet MS", "Lucida Console"];
+  const results = [];
+  for (const font of fonts) {
+    for (const [weight, size] of [[400, 44], [600, 48], [700, 52]]) {
+      const c = makeGrid(font, weight, size);
+      const side = c.width;
+      const pad = document.createElement("canvas");
+      pad.width = side + 48; pad.height = side + 48;
+      const pctx = pad.getContext("2d");
+      pctx.fillStyle = "#fff"; pctx.fillRect(0, 0, pad.width, pad.height);
+      pctx.drawImage(c, IMG_PAD, IMG_PAD);
+      const data = pctx.getImageData(0, 0, pad.width, pad.height).data;
+      const raw = [[IMG_PAD, IMG_PAD], [IMG_PAD + side - 1, IMG_PAD],
+                   [IMG_PAD + side - 1, IMG_PAD + side - 1], [IMG_PAD, IMG_PAD + side - 1]];
+      const { quad } = refineQuad(data, pad.width, pad.height, raw, 2);
+      const view = analyseGrid(data, pad.width, pad.height, quad, 0);
+      const cells = extractCells(view);
+      const present = cells.filter((x) => x.present);
+      const scores = await engine.digits.predict(present);
+      const pred = scores.map((s) => {
+        let b = 0; for (let i = 1; i < s.length; i++) if (s[i] > s[b]) b = i;
+        return b + 1;
+      });
+      const target = [1,2,3,4,5,6,7,8,9];
+      const ok = pred.length === 9 && pred.every((v, i) => v === target[i]);
+      results.push({ font, weight, size, ok, pred: pred.join("") });
+    }
+  }
+  document.getElementById("out").textContent = results
+    .map((r) => `${r.ok ? "OK  " : "FAIL"} ${r.font} ${r.weight}/${r.size}: ${r.pred}`).join("\n");
+  window.__done = true;
+  return results;
+};
+window.__ready = true;
+</script>
+</body></html>

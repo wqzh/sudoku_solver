@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>solve test</title></head>
+<body>
+<pre id="out">booting…</pre>
+<script src="/vendor/ort/ort.wasm.min.js"></script>
+<script type="module">
+import { createEngine, solveImage } from "/src/core/pipeline.js";
+
+ort.env.wasm.wasmPaths = "/vendor/ort/";
+const __threads = Number(new URLSearchParams(location.search).get("threads") || 1);
+ort.env.wasm.numThreads = __threads;
+
+window.__ready = (async () => {
+  const t0 = performance.now();
+  window.__engine = await createEngine({
+    detectorUrl: "/models/grid_detector_yolov8n_640_int8.onnx",
+    digitUrl: "/models/digit_classifier_28x28.onnx",
+  });
+  return Math.round(performance.now() - t0);
+})();
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+window.__run = async (dataUrl) => {
+  await window.__ready;
+  const img = await loadImage(dataUrl);
+  const canvas = document.createElement("canvas");
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  canvas.getContext("2d").drawImage(img, 0, 0);
+
+  const logs = [];
+  const res = await solveImage(canvas, window.__engine, {
+    timeBudget: 60000,
+    onProgress: (m) => logs.push(m),
+  });
+  return {
+    ok: res.ok,
+    message: res.message,
+    givens: res.givens,
+    filled: res.filled,
+    score: res.score,
+    rotation: res.rotation,
+    seconds: res.seconds,
+    board: res.board,
+    solved: res.solved,
+    boxes: res.boxes,
+    logs,
+    attempts: res.attempts,
+    debugBoard: res.debug ? res.debug.board : null,
+    warpUrl: (() => {
+      if (!res.debug) return null;
+      const v = res.debug.view;
+      const c = document.createElement("canvas");
+      c.width = v.side; c.height = v.side;
+      const ctx = c.getContext("2d");
+      const id = new ImageData(new Uint8ClampedArray(v.warped), v.side, v.side);
+      ctx.putImageData(id, 0, 0);
+      return c.toDataURL("image/png");
+    })(),
+    outUrl: res.canvas ? res.canvas.toDataURL("image/png") : null,
+  };
+};
+window.__status = "READY";
+</script>
+</body>
+</html>

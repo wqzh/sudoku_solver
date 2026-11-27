@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>数独识别求解 · 手机端体验</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml" />
+<style>
+  :root {
+    --ink: #0b1020;
+    --muted: #5b6478;
+    --line: #e5e9f2;
+    --accent: #4f46e5;
+    --accent2: #7c3aed;
+    --bg: #f7f8fc;
+    --card: #fff;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: "PingFang SC", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; text-decoration: none; }
+
+  .nav {
+    position: sticky; top: 0; z-index: 30;
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px clamp(16px, 4vw, 48px);
+    background: rgba(247, 248, 252, .82);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid rgba(229, 233, 242, .9);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .2px; }
+  .brand img { width: 34px; height: 34px; border-radius: 10px; }
+  .nav .links { margin-left: auto; display: flex; gap: 18px; font-size: 14px; color: var(--muted); }
+  .nav .links a:hover { color: var(--ink); }
+  .nav .cta {
+    margin-left: 8px; background: var(--ink); color: #fff;
+    padding: 9px 16px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  }
+  @media (max-width: 720px) { .nav .links { display: none; } }
+
+  .hero {
+    position: relative; overflow: hidden;
+    padding: clamp(28px, 6vw, 64px) clamp(16px, 4vw, 48px) clamp(20px, 4vw, 50px);
+    display: grid; grid-template-columns: 1.05fr .95fr; gap: clamp(16px, 4vw, 56px);
+    align-items: center; max-width: 1180px; margin: 0 auto;
+  }
+  .hero::before {
+    content: ""; position: absolute; inset: -20% -10% auto auto; width: 520px; height: 520px;
+    background: radial-gradient(circle at 50% 50%, rgba(99, 102, 241, .18), transparent 62%);
+    filter: blur(2px); pointer-events: none;
+  }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; color: #4338ca; background: #eef2ff;
+    padding: 6px 12px; border-radius: 999px; font-weight: 600;
+  }
+  h1 {
+    font-size: clamp(30px, 5vw, 52px); line-height: 1.12; margin: 18px 0 14px;
+    letter-spacing: -.02em;
+  }
+  h1 em { font-style: normal; background: linear-gradient(100deg, #4f46e5, #9333ea); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lede { color: var(--muted); font-size: clamp(15px, 1.4vw, 17px); max-width: 46ch; margin: 0 0 24px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+  .btn {
+    border: 0; cursor: pointer; font: inherit; font-weight: 650; font-size: 15px;
+    padding: 13px 22px; border-radius: 13px; transition: transform .08s, box-shadow .2s;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary { background: linear-gradient(145deg, #4f46e5, #4338ca); color: #fff; box-shadow: 0 12px 28px rgba(79, 70, 229, .28); }
+  .btn.line { background: #fff; border: 1px solid var(--line); color: var(--ink); }
+  .facts { display: flex; gap: 22px; margin-top: 26px; flex-wrap: wrap; }
+  .fact b { display: block; font-size: 18px; }
+  .fact span { font-size: 12px; color: var(--muted); }
+
+  /* phone */
+  .phone-stage { display: flex; justify-content: center; perspective: 1200px; }
+  .phone {
+    width: min(390px, 100%); height: min(800px, 78vh); min-height: 520px;
+    background: #0b1020; border-radius: 46px; padding: 12px;
+    box-shadow: 0 40px 80px rgba(15, 23, 42, .28), inset 0 0 0 1px rgba(255,255,255,.06);
+    position: relative;
+  }
+  .phone::after {
+    content: ""; position: absolute; left: 50%; top: 12px; transform: translateX(-50%);
+    width: 92px; height: 5px; background: rgba(255,255,255,.18); border-radius: 999px;
+  }
+  .phone iframe {
+    width: 100%; height: 100%; border: 0; border-radius: 36px; background: #fff; display: block;
+  }
+  .phone-note { text-align: center; font-size: 12px; color: var(--muted); margin-top: 12px; }
+
+  section.block { max-width: 1120px; margin: 0 auto; padding: clamp(30px, 6vw, 72px) clamp(16px, 4vw, 48px); }
+  .sec-head { max-width: 620px; margin-bottom: 26px; }
+  .sec-head h2 { font-size: clamp(22px, 3vw, 30px); margin: 0 0 8px; letter-spacing: -.01em; }
+  .sec-head p { color: var(--muted); margin: 0; font-size: 15px; }
+
+  .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 900px) { .grid4 { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 520px) { .grid4 { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+    padding: 20px 18px; box-shadow: 0 1px 2px rgba(15,23,42,.04);
+  }
+  .card .ico {
+    width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center;
+    background: #eef2ff; color: #4338ca; margin-bottom: 12px;
+  }
+  .card h3 { font-size: 15px; margin: 0 0 6px; }
+  .card p { font-size: 13px; color: var(--muted); margin: 0; line-height: 1.6; }
+
+  .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; counter-reset: step; }
+  @media (max-width: 720px) { .flow { grid-template-columns: 1fr 1fr; } }
+  .step {
+    position: relative; background: #fff; border: 1px solid var(--line); border-radius: 16px;
+    padding: 18px 16px 16px;
+  }
+  .step::before {
+    counter-increment: step; content: "0" counter(step);
+    font-size: 12px; font-weight: 700; color: #a5b4fc; letter-spacing: .08em;
+  }
+  .step h4 { margin: 6px 0 4px; font-size: 14px; }
+  .step p { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+
+  .specs { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .specs { grid-template-columns: 1fr; } }
+  .spec {
+    background: #0b1020; color: #e5e7eb; border-radius: 18px; padding: 20px;
+    font-family: "SFMono-Regular", Consolas, monospace; font-size: 12.5px; line-height: 1.8;
+    overflow: auto;
+  }
+  .spec h4 { font-family: inherit; font-size: 13px; margin: 0 0 10px; color: #a5b4fc; }
+  .spec span { color: #93c5fd; }
+  .spec .dim { color: #94a3b8; }
+
+  .band {
+    background: linear-gradient(140deg, #0b1020, #1e1b4b 55%, #312e81);
+    color: #e8eaf6; border-radius: 24px; padding: clamp(24px, 4vw, 40px);
+    display: flex; gap: 24px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  }
+  .band h2 { margin: 0 0 6px; font-size: clamp(20px, 2.6vw, 28px); }
+  .band p { margin: 0; color: #b9c0d8; font-size: 14px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 26px 16px 40px; }
+
+  @media (max-width: 900px) {
+    .hero { grid-template-columns: 1fr; }
+    .phone { height: min(640px, 74vh); }
+  }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="brand"><img src="/assets/icon.svg" alt="" />数独识别求解</div>
+  <div class="links">
+    <a href="#try">在线体验</a>
+    <a href="#features">能力</a>
+    <a href="#pipeline">流程</a>
+    <a href="#models">模型</a>
+  </div>
+  <a class="cta" href="/index.html">打开应用</a>
+</nav>
+
+<header class="hero">
+  <div>
+    <span class="eyebrow">● 手机端 · 纯本地推理</span>
+    <h1>拍一张照片，<br /><em>把整盘数独解出来</em></h1>
+    <p class="lede">
+      YOLOv8 定位网格，28×28 数字模型识别题面，位运算回溯求解，
+      再把答案用红色叠回原图。整个流程在你手机浏览器里完成，图片不上传。
+    </p>
+    <div class="actions">
+      <button class="btn primary" id="trySample">载入示例题试试</button>
+      <a class="btn line" href="#features">看看怎么做到的</a>
+    </div>
+    <div class="facts">
+      <div class="fact"><b>3.4 MB</b><span>两个模型合计</span></div>
+      <div class="fact"><b>&lt; 3 s</b><span>桌面端单题耗时</span></div>
+      <div class="fact"><b>0 上传</b><span>照片留在本机</span></div>
+    </div>
+  </div>
+
+  <div class="phone-stage">
+    <div>
+      <div class="phone"><iframe id="appFrame" src="/index.html?embed=1" title="数独识别求解应用"></iframe></div>
+      <div class="phone-note">↓ 这是真实应用，不是截图，直接在上面操作</div>
+    </div>
+  </div>
+</header>
+
+<section class="block" id="try">
+  <div class="sec-head">
+    <h2>三步用起来</h2>
+    <p>点「示例题」会生成一张标准数独图，也可以换成你自己的照片。</p>
+  </div>
+  <div class="flow">
+    <div class="step"><h4>选图或拍照</h4><p>相册、相机、拖拽、粘贴都可以，支持倾斜与手持拍摄。</p></div>
+    <div class="step"><h4>自动定位网格</h4><p>检测模型找到网格四边形，透视校正成标准 9×9 画布。</p></div>
+    <div class="step"><h4>识别与求解</h4><p>逐格切分识别数字，回溯求解；识别有误时用次优候选自动纠错。</p></div>
+    <div class="step"><h4>答案回贴</h4><p>只在原本空白的格子里写红色答案，位置随原图透视一起对齐。</p></div>
+  </div>
+</section>
+
+<section class="block" id="features">
+  <div class="sec-head">
+    <h2>和网页版同一套算法</h2>
+    <p>Python 管线逐段移植到 JavaScript，验收标准是与原版逐格一致。</p>
+  </div>
+  <div class="grid4">
+    <div class="card">
+      <div class="ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 8V5a1 1 0 0 1 1-1h3M20 8V5a1 1 0 0 0-1-1h-3M4 16v3a1 1 0 0 0 1 1h3M20 16v3a1 1 0 0 1-1 1h-3"/><path d="M4 12h16M12 4v16"/></svg></div>
+      <h3>YOLO 网格检测</h3>
+      <p>单类检测器给出网格框，再用线条评分把四边形收紧到最外层网格线上。</p>
+    </div>
+    <div class="card">
+      <div class="ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M4 12h10M4 17h7"/></svg></div>
+      <h3>自适应二值化</h3>
+      <p>光照归一 + 均值自适应阈值，再擦掉网格线，弱光、阴影下也能稳定切格。</p>
+    </div>
+    <div class="card">
+      <div class="ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v18M5 8h14M6 3h12a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"/></svg></div>
+      <h3>29 候选纠错</h3>
+      <p>先用最优解；无解时用置信度最低的 1–2 个数字换次优类重试，再试 4 个旋转。</p>
+    </div>
+    <div class="card">
+      <div class="ico"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3 4 7v5c0 5 3.5 8 8 9 4.5-1 8-4 8-9V7l-8-4Z"/></svg></div>
+      <h3>不上传照片</h3>
+      <p>ONNX Runtime Web 在本机 WASM 里推理，没有服务端，没有接口调用。</p>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="pipeline">
+  <div class="sec-head">
+    <h2>一条完整管线</h2>
+    <p>从像素到答案，每一步都可单独调参数。</p>
+  </div>
+  <div class="flow">
+    <div class="step"><h4>1000 px 工作图</h4><p>等比缩放并补 24 px 白边，避免贴边网格轮廓不闭合。</p></div>
+    <div class="step"><h4>740 px 校正图</h4><p>四点到四边形单应变换，9×80 px 单元格 + 10 px 边距。</p></div>
+    <div class="step"><h4>81 个 28×28 掩膜</h4><p>白字黑底、0–255 不归一化，与训练时完全一致。</p></div>
+    <div class="step"><h4>位运算回溯</h4><p>最少候选优先，节点与时间双上限，最难的盘面也秒解。</p></div>
+  </div>
+</section>
+
+<section class="block" id="models">
+  <div class="sec-head">
+    <h2>模型与依赖</h2>
+    <p>和网页版线上使用的是同一对权重。</p>
+  </div>
+  <div class="specs">
+    <div class="spec">
+      <h4>网格检测器</h4>
+      grid_detector_yolov8n_640_int8.onnx<br />
+      输入 <span>[1,3,640,640]</span> <span class="dim">NCHW / RGB / ÷255</span><br />
+      输出 <span>[1,5,8400]</span> <span class="dim">YOLOv8 head</span><br />
+      量化 <span>INT8 动态</span> · 3.28 MB · opset 22
+    </div>
+    <div class="spec">
+      <h4>数字识别器</h4>
+      digit_classifier_28x28.onnx<br />
+      输入 <span>[N,28,28,1]</span> <span class="dim">0–255 白字黑底</span><br />
+      输出 <span>[N,9]</span> <span class="dim">数字 1–9</span><br />
+      132 KB · opset 13 · 无空白类
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="band">
+    <div>
+      <h2>现在就试一张自己的题</h2>
+      <p>支持打印件、书本、手写；答案直接叠在照片上，可保存分享。</p>
+    </div>
+    <a class="btn primary" href="/index.html">打开应用</a>
+  </div>
+</section>
+
+<footer>数独识别求解 · 手机端体验页 · 模型与推理均在本机完成</footer>
+
+<script>
+  const frame = document.getElementById("appFrame");
+  const send = () => frame.contentWindow.postMessage({ type: "nextwork:sample" }, location.origin);
+  document.getElementById("trySample").addEventListener("click", () => {
+    document.getElementById("try").scrollIntoView({ behavior: "smooth" });
+    send();
+  });
+</script>
+</body>
+</html>

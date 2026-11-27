@@ -1,0 +1,14 @@
+{
+  "name": "数独识别求解",
+  "short_name": "数独求解",
+  "description": "拍照识别数独并自动求解，模型与推理全部在手机本地完成。",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f5f8",
+  "theme_color": "#4f46e5",
+  "icons": [
+    { "src": "./assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "schema": "nextwork.sudoku.mobile-models/1",
+  "generated_at": "2026-11-07T11:18:21+08:00",
+  "models": [
+    {
+      "id": "grid_detector",
+      "file": "grid_detector_yolov8n_640_int8.onnx",
+      "role": "sudoku grid detection (YOLOv8, single class)",
+      "source": "../det_model/best.onnx-quant-ir9.onnx",
+      "bytes": 3436892,
+      "sha256": "67A1E0DFE37C66816664A621D10BF8D4D0CCA680E13588F57CEB34EE2BB42FA7",
+      "opset": 22,
+      "ir_version": 10,
+      "producer": "onnx.quantize 0.1.0",
+      "quantization": { "type": "dynamic_int8", "weights": "int8", "activations": "float32/dynamic" },
+      "input": {
+        "name": "images",
+        "shape": [1, 3, 640, 640],
+        "dtype": "float32",
+        "layout": "NCHW",
+        "preprocess": "letterbox(640, pad=114) -> RGB -> /255"
+      },
+      "output": {
+        "name": "output0",
+        "shape": [1, 5, 8400],
+        "dtype": "float32",
+        "layout": "1 x (4 box + 1 class score) x anchors, YOLOv8 head, no objectness",
+        "postprocess": "transpose to 8400x5; conf=0.25; IoU NMS=0.45; undo letterbox"
+      }
+    },
+    {
+      "id": "digit_classifier",
+      "file": "digit_classifier_28x28.onnx",
+      "role": "handwritten/printed sudoku digit classification (1-9, no blank class)",
+      "source": "../src_onnx/model.onnx",
+      "bytes": 135290,
+      "sha256": "448A017C55BD90D3508D88795AB5F143858D6DBCC5737FE397FE47C1576F16A0",
+      "opset": 13,
+      "ir_version": 8,
+      "producer": "keras -> onnx",
+      "input": {
+        "name": "input",
+        "shape": ["batch", 28, 28, 1],
+        "dtype": "float32",
+        "layout": "NHWC",
+        "preprocess": "white digit on black, 28x28, values 0..255 (NOT normalized)"
+      },
+      "output": {
+        "name": "output",
+        "shape": ["batch", 9],
+        "dtype": "float32",
+        "semantics": "scores for digits 1..9; predicted digit = argmax + 1; blank cells are filtered before inference"
+      }
+    }
+  ],
+  "reference_pipeline": {
+    "source": "app/pipeline.py + app/sudoku_utils.py",
+    "steps": [
+      "resize input to 1000px wide",
+      "detect grid quad (classical contour search + YOLO boxes as extra candidates)",
+      "perspective warp to 9*80=720px square",
+      "slice 81 cells, erase grid lines, keep 28x28 white-on-black digit masks",
+      "classify digits, build 9x9 board (needs >= 17 givens)",
+      "bitmask backtracking solver, retry with 2nd-best digit on failure, try 0/90/180/270 rotations",
+      "draw solved digits in red back onto the original image"
+    ]
+  },
+  "baseline_check": {
+    "input": "../.test_input/15.jpg",
+    "runtime": "onnxruntime CPU (python)",
+    "ok": true,
+    "grid_score": 0.9935,
+    "rotation": 0,
+    "givens": 25,
+    "seconds": 1.14
+  }
+}

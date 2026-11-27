@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f4f5f8" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="数独求解" />
+  <title>数独识别求解 · 手机端</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <header class="appbar">
+    <div class="logo">9</div>
+    <div>
+      <h1>数独识别求解</h1>
+      <p>拍照即解 · 全程离线</p>
+    </div>
+    <span class="pill" id="status">模型加载中</span>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="drop" id="drop" role="button" tabindex="0" aria-label="选择或拍摄数独照片">
+        <input type="file" id="file" accept="image/*" capture="environment" hidden />
+        <div class="drop-empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
+          </svg>
+          <b>拍照或选择图片</b>
+          <span>也可以把图片拖到这里，或直接 Ctrl+V 粘贴</span>
+        </div>
+        <canvas id="preview"></canvas>
+      </div>
+
+      <div class="row">
+        <button class="ghost" id="pick">相册 / 拍照</button>
+        <button class="ghost" id="sample">示例题</button>
+        <button class="primary" id="solve" disabled>求解</button>
+      </div>
+
+      <div class="hint">
+        <span>支持打印、手写、倾斜拍摄</span>
+        <span>·</span>
+        <span>答案以红色叠加在原图</span>
+      </div>
+      <p class="mini" id="engineNote" style="margin:10px 2px 0"></p>
+    </section>
+
+    <section class="card" id="resultCard" hidden>
+      <div class="result-head">
+        <h2>识别结果</h2>
+        <span class="badge" id="resultBadge">求解成功</span>
+      </div>
+
+      <div class="tabs">
+        <button class="active" data-tab="image">答案图</button>
+        <button data-tab="board">盘面</button>
+      </div>
+
+      <div id="paneImage" class="canvas-wrap">
+        <canvas id="out"></canvas>
+      </div>
+
+      <div id="paneBoard" hidden>
+        <div class="board" id="board"></div>
+        <div class="hint" style="margin-top:10px">
+          <span><b style="color:#0f172a">黑色</b> 为原题数字</span>
+          <span><b style="color:#dc2626">红色</b> 为求解填入</span>
+        </div>
+      </div>
+
+      <div class="stats" id="stats"></div>
+      <p class="msg" id="msg" style="display:none"></p>
+      <button class="wide ghost" id="download" style="margin-top:12px">保存答案图片</button>
+    </section>
+
+    <div class="progress" id="progress" hidden>
+      <div class="spinner"></div>
+      <span id="progressText">准备中…</span>
+    </div>
+    <p class="msg" id="notice" hidden></p>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="/vendor/ort/ort.wasm.min.js"></script>
+  <script type="module" src="/src/app/main.js"></script>
+</body>
+</html>
